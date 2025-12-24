@@ -8,7 +8,8 @@
     "build": "vite build && node scripts/copy-404.js",
     "build:dev": "vite build --mode development && node scripts/copy-404.js",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server": "node server/index.js"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -59,7 +60,9 @@
     "tailwind-merge": "^2.6.0",
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^0.9.9",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
