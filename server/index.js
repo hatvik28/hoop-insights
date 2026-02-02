@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 
@@ -72,6 +73,34 @@ function getTodayFormatted() {
 // Store game and player data for lookups
 const gameCache = new Map();
 
+// Team lookup map (ID -> team info with abbreviation)
+const teamMap = new Map();
+
+// Fetch all NBA teams and build lookup map
+async function loadTeams() {
+  try {
+    const response = await bdlFetch("/teams");
+    const teams = response.data ?? [];
+    teams.forEach(team => {
+      teamMap.set(team.id, {
+        id: team.id,
+        abbreviation: team.abbreviation,
+        name: team.name,
+        full_name: team.full_name,
+        city: team.city,
+      });
+    });
+    // eslint-disable-next-line no-console
+    console.log(`Loaded ${teamMap.size} teams into lookup map`);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Error loading teams:", error);
+  }
+}
+
+// Load teams on startup
+loadTeams();
+
 // --- Routes ---
 
 // List of today's games
@@ -94,7 +123,7 @@ app.get("/api/games", async (req, res) => {
       // The API returns date as "YYYY-MM-DD" - append T12:00:00 to avoid timezone shifts
       // Also check for datetime or time fields if available
       let startTime = g.datetime || g.date;
-      
+
       // If it's just a date (no time component), add noon to prevent day shift
       if (startTime && !startTime.includes('T') && !startTime.includes(':')) {
         startTime = `${startTime}T12:00:00`;
@@ -123,14 +152,47 @@ app.get("/api/games", async (req, res) => {
   }
 });
 
-// Players for a given game - fetch active players for both teams
+// Helper to parse minutes string (e.g., "32:15" or "32") to decimal minutes
+function parseMinutes(minStr) {
+  if (!minStr || minStr === "0:00" || minStr === "00" || minStr === "0") return 0;
+  if (typeof minStr === "number") return minStr;
+  
+  // Handle "MM:SS" format
+  if (minStr.includes(":")) {
+    const [mins, secs] = minStr.split(":").map(Number);
+    return mins + (secs || 0) / 60;
+  }
+  
+  return parseFloat(minStr) || 0;
+}
+
+// Helper to calculate average minutes from stats array
+function calculateAvgMinutes(stats) {
+  if (!stats || stats.length === 0) return 0;
+  
+  // Filter out games where player didn't play
+  const gamesPlayed = stats.filter(g => {
+    const mins = parseMinutes(g.min);
+    return mins > 0;
+  });
+  
+  if (gamesPlayed.length === 0) return 0;
+  
+  const totalMinutes = gamesPlayed.reduce((sum, g) => sum + parseMinutes(g.min), 0);
+  return totalMinutes / gamesPlayed.length;
+}
+
+// Minimum average minutes threshold to be considered a "rotation player"
+const MIN_AVG_MINUTES = 15;
+
+// Players for a given game - fetch active players filtered by playing time
 app.get("/api/games/:gameId/players", async (req, res) => {
   const { gameId } = req.params;
 
   try {
     // Get game info from cache or fetch games
     let game = gameCache.get(gameId);
-    
+
     if (!game) {
       // Fetch the specific game
       const gameResponse = await bdlFetch(`/games/${gameId}`);
@@ -171,8 +233,65 @@ app.get("/api/games/:gameId/players", async (req, res) => {
     }
 
     // eslint-disable-next-line no-console
-    console.log(`Returning ${allPlayers.length} players for game ${gameId}`);
-    res.json(allPlayers);
+    console.log(`Found ${allPlayers.length} total active players for game ${gameId}`);
+
+    // Batch fetch stats for all players to calculate average minutes
+    // Split into chunks to avoid URL length limits (max ~20 players per request)
+    const playerIds = allPlayers.map(p => p.id);
+    const chunkSize = 20;
+    const statsMap = new Map(); // playerId -> stats array
+
+    for (let i = 0; i < playerIds.length; i += chunkSize) {
+      const chunk = playerIds.slice(i, i + chunkSize);
+      const playerIdsParam = chunk.map(id => `player_ids[]=${id}`).join("&");
+      
+      try {
+        const statsResponse = await bdlFetch(`/stats?${playerIdsParam}&seasons[]=2025&per_page=100`);
+        const stats = statsResponse.data ?? [];
+        
+        // Group stats by player ID
+        stats.forEach(stat => {
+          const pid = stat.player?.id?.toString();
+          if (pid) {
+            if (!statsMap.has(pid)) {
+              statsMap.set(pid, []);
+            }
+            statsMap.get(pid).push(stat);
+          }
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`Error fetching stats batch:`, err.message);
+      }
+    }
+
+    // Calculate average minutes for each player and filter
+    const playersWithMinutes = allPlayers.map(player => {
+      const stats = statsMap.get(player.id) || [];
+      const avgMinutes = calculateAvgMinutes(stats);
+      return {
+        ...player,
+        avgMinutes: Math.round(avgMinutes * 10) / 10,
+        gamesPlayed: stats.filter(g => parseMinutes(g.min) > 0).length,
+      };
+    });
+
+    // Filter to players with 15+ average minutes and sort by minutes (descending)
+    const filteredPlayers = playersWithMinutes
+      .filter(p => p.avgMinutes >= MIN_AVG_MINUTES)
+      .sort((a, b) => b.avgMinutes - a.avgMinutes);
+
+    // eslint-disable-next-line no-console
+    console.log(`Filtered to ${filteredPlayers.length} rotation players (${MIN_AVG_MINUTES}+ min avg)`);
+    
+    // Log top players for debugging
+    if (filteredPlayers.length > 0) {
+      const sample = filteredPlayers.slice(0, 5).map(p => `${p.name}: ${p.avgMinutes} min`);
+      // eslint-disable-next-line no-console
+      console.log(`Top players:`, sample);
+    }
+
+    res.json(filteredPlayers);
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error("Error fetching players:", error);
@@ -215,9 +334,9 @@ app.get("/api/players/:playerId/stats", async (req, res) => {
     const statsResponse = await bdlFetch(
       `/stats?player_ids[]=${playerId}&seasons[]=2025&per_page=100`
     );
-    
+
     let gameStats = statsResponse.data ?? [];
-    
+
     // eslint-disable-next-line no-console
     console.log(`Found ${gameStats.length} game stats for 2025 season`);
 
@@ -253,10 +372,10 @@ app.get("/api/players/:playerId/stats", async (req, res) => {
       // Filter out games where player didn't play (0 minutes)
       const gamesPlayed = gameStats.filter(g => g.min && g.min !== "0:00" && g.min !== "00");
       const totalPoints = gamesPlayed.reduce((sum, g) => sum + (g.pts ?? 0), 0);
-      seasonAvgPoints = gamesPlayed.length > 0 
-        ? Math.round((totalPoints / gamesPlayed.length) * 10) / 10 
+      seasonAvgPoints = gamesPlayed.length > 0
+        ? Math.round((totalPoints / gamesPlayed.length) * 10) / 10
         : 0;
-      
+
       // eslint-disable-next-line no-console
       console.log(`Games played: ${gamesPlayed.length}, Total points: ${totalPoints}, Avg: ${seasonAvgPoints}`);
     }
@@ -272,27 +391,23 @@ app.get("/api/players/:playerId/stats", async (req, res) => {
       // Get opponent from game data
       const gameData = g.game ?? {};
       const statTeamId = g.team?.id;
+
+      // Stats endpoint returns home_team_id and visitor_team_id (just IDs, not objects)
+      // Use our team lookup map to get the abbreviation
+      const homeTeamId = gameData.home_team_id ?? gameData.home_team?.id;
+      const visitorTeamId = gameData.visitor_team_id ?? gameData.visitor_team?.id;
       
-      // Determine if player's team was home or away, then get opponent
-      const isHome = statTeamId === gameData.home_team?.id;
-      const opponentTeam = isHome ? gameData.visitor_team : gameData.home_team;
+      // Determine if player's team was home or away
+      const isHome = statTeamId === homeTeamId;
+      const opponentTeamId = isHome ? visitorTeamId : homeTeamId;
       
-      // Try abbreviation first, then fall back to name-based abbreviation
-      let opponent = opponentTeam?.abbreviation;
-      if (!opponent && opponentTeam?.name) {
-        // Create abbreviation from team name (e.g., "Raptors" -> "TOR")
-        opponent = opponentTeam.name.substring(0, 3).toUpperCase();
-      }
-      if (!opponent && opponentTeam?.full_name) {
-        // Try to extract from full name (e.g., "Toronto Raptors")
-        const parts = opponentTeam.full_name.split(" ");
-        opponent = parts[parts.length - 1].substring(0, 3).toUpperCase();
-      }
-      opponent = opponent || "OPP";
+      // Look up opponent team from our map
+      const opponentTeamInfo = teamMap.get(opponentTeamId);
+      const opponent = opponentTeamInfo?.abbreviation || "OPP";
 
       return {
-        date: gameData.date 
-          ? new Date(gameData.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }) 
+        date: gameData.date
+          ? new Date(gameData.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })
           : "",
         opponent: opponent,
         points: g.pts ?? 0,
