@@ -133,11 +133,12 @@ app.get("/api/games", async (req, res) => {
         id: g.id.toString(),
         homeTeam: g.home_team?.full_name ?? g.home_team?.name ?? "Home",
         awayTeam: g.visitor_team?.full_name ?? g.visitor_team?.name ?? "Away",
+        homeTeamAbbr: g.home_team?.abbreviation ?? null,
+        awayTeamAbbr: g.visitor_team?.abbreviation ?? null,
         homeTeamId: g.home_team?.id,
         awayTeamId: g.visitor_team?.id,
         startTime: startTime,
         status: g.status,
-        // Include time if available from API
         time: g.time || null,
       };
     });
@@ -386,41 +387,69 @@ app.get("/api/players/:playerId/stats", async (req, res) => {
       console.log("Sample stat game data:", JSON.stringify(gameStats[0].game, null, 2));
     }
 
-    // Map to our format - take last 10 games
-    const last10Games = gameStats.slice(0, 10).map((g) => {
-      // Get opponent from game data
+    const tonightOpponentTeamId = opponentTeam?.id;
+
+    // Helper: map a stat row to our game log format
+    const toGameLog = (g) => {
       const gameData = g.game ?? {};
       const statTeamId = g.team?.id;
-
-      // Stats endpoint returns home_team_id and visitor_team_id (just IDs, not objects)
-      // Use our team lookup map to get the abbreviation
       const homeTeamId = gameData.home_team_id ?? gameData.home_team?.id;
       const visitorTeamId = gameData.visitor_team_id ?? gameData.visitor_team?.id;
-      
-      // Determine if player's team was home or away
       const isHome = statTeamId === homeTeamId;
       const opponentTeamId = isHome ? visitorTeamId : homeTeamId;
-      
-      // Look up opponent team from our map
       const opponentTeamInfo = teamMap.get(opponentTeamId);
       const opponent = opponentTeamInfo?.abbreviation || "OPP";
-
       return {
         date: gameData.date
           ? new Date(gameData.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })
           : "",
-        opponent: opponent,
+        opponent,
         points: g.pts ?? 0,
         rebounds: g.reb ?? 0,
         assists: g.ast ?? 0,
         minutes: g.min ?? "0",
       };
-    });
+    };
+
+    // Last 10 games (all opponents)
+    const last10Games = gameStats.slice(0, 10).map(toGameLog);
+
+    // All games vs tonight's opponent this season (however many they played)
+    const gamesVsOpponent = gameStats
+      .filter((g) => {
+        const gameData = g.game ?? {};
+        const statTeamId = g.team?.id;
+        const homeTeamId = gameData.home_team_id ?? gameData.home_team?.id;
+        const visitorTeamId = gameData.visitor_team_id ?? gameData.visitor_team?.id;
+        const isHome = statTeamId === homeTeamId;
+        const opponentInGame = isHome ? visitorTeamId : homeTeamId;
+        return opponentInGame === tonightOpponentTeamId;
+      })
+      .map(toGameLog);
+
+    // Avg PPG vs this opponent (only games with minutes played)
+    let avgPpgVsOpponent = 0;
+    if (gamesVsOpponent.length > 0) {
+      const withMinutes = gamesVsOpponent.filter(
+        (g) => g.minutes && g.minutes !== "0:00" && g.minutes !== "00" && g.minutes !== "0"
+      );
+      const totalPts = withMinutes.reduce((sum, g) => sum + g.points, 0);
+      avgPpgVsOpponent = withMinutes.length > 0
+        ? Math.round((totalPts / withMinutes.length) * 10) / 10
+        : 0;
+    }
+
+    const opponentAbbr =
+      teamMap.get(tonightOpponentTeamId)?.abbreviation ??
+      opponentTeam?.abbreviation ??
+      null;
 
     if (last10Games.length > 0) {
       // eslint-disable-next-line no-console
       console.log(`Sample game:`, last10Games[0]);
     }
+    // eslint-disable-next-line no-console
+    console.log(`Vs tonight's opponent: ${gamesVsOpponent.length} games, ${avgPpgVsOpponent} PPG`);
 
     // eslint-disable-next-line no-console
     console.log(`=== End Player Stats ===\n`);
@@ -431,9 +460,11 @@ app.get("/api/players/:playerId/stats", async (req, res) => {
         name: playerName,
       },
       opponentTeam: opponentTeam?.full_name ?? opponentTeam?.name ?? "Opponent",
+      opponentTeamAbbr: opponentAbbr,
       seasonAvgPoints,
       last10Games,
-      last10VsOpponent: [],
+      last10VsOpponent: gamesVsOpponent,
+      avgPpgVsOpponent,
     });
   } catch (error) {
     // eslint-disable-next-line no-console
