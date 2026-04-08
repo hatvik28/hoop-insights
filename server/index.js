@@ -10,7 +10,9 @@ import oddsRouter from "./routes/odds.js";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: ["https://hatvik28.github.io", "http://localhost:8080"],
+}));
 app.use(express.json());
 
 loadTeams();
